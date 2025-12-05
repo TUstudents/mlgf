@@ -1,70 +1,166 @@
 import os
 import numpy as np
-from pyscf import scf, lib, cc
+from mlgf.data import Dataset, Moldatum
+from mlgf.lib.helpers import get_sigma_ml, get_vmo, get_sigma_fit, sigma_lo_mo, get_pade18, get_pyscf_input_mol
+from mlgf.lib.dm_helper import get_ac_dm_dyson, get_dm_linear, make_frozen_no
+from mlgf.workflow.qp_energy import get_quasiparticle_energies
+from mlgf.lib.gfhelper import my_AC_pade_thiele_diag
+from mlgf.lib.doshelper import get_dos_hf, get_dos_orthbasis_fullinv, get_dos_orthbasis_diag, calc_dos, calc_dos_pes, calc_dos_pes_experimental
+from pyscf import scf, lib, dft, cc
 import joblib
 
 import argparse
+from PIL import Image
 import json
+
 import pandas as pd
 
-from fcdmft.ac.pade import PadeAC
-from fcdmft.ac.two_pole import TwoPoleAC
+from fcdmft.gw.mol.gw_ac import pade_thiele, thiele
+from fcdmft.gw.mol.gw_gf import get_g0
+from fcdmft.gw.mol.gw_gf import GWGF, GWAC
+# from fcdmft.gw.mol.bse import BSE, _get_oscillator_strength
+# from fcdmft.utils.memory_estimate import check_memory_gwbse
 
+from mlgf.workflow.model_errors import get_hlb, get_dos_mre, validations_to_table
 
-from mlgf.workflow.model_errors import validations_to_table
-from mlgf.lib.ml_helper import get_sigma_ml, get_vmo, sigma_lo_mo, get_pade18
-from mlgf.lib.dm_helper import get_dm_dyson, get_dm_linear, make_frozen_no
-from mlgf.lib.dos_helper import calc_dos
+def get_hlb(out, energy_levels):
+    """Get HOMO/LUMO/Band gap
 
-from scipy.optimize import newton
+    Args:
+        out (dict): dictionary that has key `energy_levels` and nocc
+        energy_levels (string): key like "qpe" or "mo_energy" that has the orbital eigenvalue vector to extract band gap quantities
 
-from mpi4py import MPI
-rank = MPI.COMM_WORLD.Get_rank()
-size = MPI.COMM_WORLD.Get_size()
-comm = MPI.COMM_WORLD
-
-def get_quasiparticle_energies(acobj, mf_mo_energy, vk_minus_vxc = None):
-    if vk_minus_vxc is None:
-        vk_minus_vxc = np.zeros((len(mf_mo_energy), len(mf_mo_energy)))
-    # self-consistently solve QP equation
-    norbs = len(mf_mo_energy)
-    qp_energy = np.zeros(norbs)
-    for p in range(norbs):
-        ac_orb_p = acobj[p, p]
-        def quasiparticle(omega):
-            sigmaR = ac_orb_p.ac_eval(omega).real
-            return omega - mf_mo_energy[p] - (sigmaR.real + vk_minus_vxc[p, p])
-        try:
-
-            e = newton(quasiparticle, mf_mo_energy[p], tol=1e-6, maxiter=100)
-            qp_energy[p] = e
-        except RuntimeError:
-            qp_energy[p] = np.nan
-
-    return qp_energy
+    Returns:
+        np.float64 (1 x 3): a vector of three numbers: HOMO/LUMO/Band gap
+    """    
+    homo = out[energy_levels][out['nocc']-1]
+    lumo = out[energy_levels][out['nocc']]
+    bg = lumo - homo
+    return np.array([homo, lumo, bg])
 
 def get_z(sigma_diag12, omega_fit12):
+    """_summary_
+
+    Args:
+        sigma_diag12 (np.complex64, norb x 2): first two points of self-energy to do FD gradient
+        omega_fit12 (np.complex64): first two points of iomega to do FD gradient
+
+    Returns:
+        np.float64: quasiparticle renormalization(s) Z
+    """    
     dsig = (sigma_diag12[:,1].imag - sigma_diag12[:,0].imag)/(omega_fit12[1].imag-omega_fit12[0].imag)
     return 1./(1-dsig)
 
-def get_properties(
-    sigma,
-    mlf,
-    freqs,
-    eta,
-    properties="dq",
-    nroot=1,
-    ac_method="pade",
-    linearized_dm=True,
-    bse_active_space=None,
-    ac_idx=None,
-    diag_dos = True
-):
+def get_dos_mre(dos_ml, dos_true):
+    """DOS error metric
+
+    Args:
+        dos_ml (np.float64): predicted DOS values
+        dos_true (np.float6): true DOS values
+
+    Returns:
+        float64: error
+    """    
+    return np.sum(np.abs(dos_ml-dos_true))/np.sum(dos_true)
+
+
+def get_bse_singlets(mlf_chkfile, qpe, nmo, nocc, nroot = 20, bse_active_space = None, xc = 'pbe0'):
+    """generates singlet excited state from qpe and existing scf stored in mlf_chkfile 
+
+    Args:
+        mlf_chkfile (string): chkfile with scf and mol objects
+        qpe (np.float64): quasiparticle energies (true or ML)
+        nmo (float64): number of MO
+        nocc (float64): number of occupied MOs
+        nroot (int, optional): number of BSE excited states to get. Defaults to 20.
+        bse_active_space (list, optional): if two floats, does BSE for QPE this energy window, if integers, does BSE in the active space of bse_active_space[0] occupied and bse_active_space[1] virtuals. Defaults to None, where BSE is done in the full space.
+        xc (str, optional): DFT functional. Defaults to 'pbe0'.
+
+    Returns:
+        _type_: _description_
+    """    
+
+    scf_data = lib.chkfile.load(mlf_chkfile, 'scf')
+    mol = lib.chkfile.load_mol(mlf_chkfile)
+
+    print('BSE nroot: ', nroot, flush = True)
+    if not bse_active_space is None:
+        if type(bse_active_space[0]) == float:
+            top_mo = qpe[nocc] + bse_active_space[1]
+            nocc_act = nocc - sum(qpe < bse_active_space[0])
+
+            nvir_act = nmo - nocc - sum(qpe > top_mo)
+            print(f"BSE (nocc, nvirt) from {bse_active_space[0]} to {top_mo} Hartree: ", nocc_act, nvir_act, flush = True)
+            bse_active_space = [nocc_act, nvir_act]
+            
+        else:
+            nocc_act = min(bse_active_space[0], nocc)
+            nvir_act = min(bse_active_space[1], nmo - nocc)
+
+            print("BSE active space (nocc, nvirt): ", nocc_act, nvir_act, flush = True)
+
+        mf = dft.RKS(mol)
+        mf.xc = xc
+        mf.__dict__.update(scf_data)
+        mf.mol.max_memory=350000
+        mo_coeff = scf_data['mo_coeff']
+        
+        gw_ml = GWAC(mf)
+        # NOTE: gw.mo_energy should be ML QP mo_energy in real MLGF+BSE
+        gw_ml.mo_energy = qpe
+        gw_ml.mo_coeff = mf.mo_coeff
+    
+        # get the density fitting integral Lpq for truncated BSE
+        nocc, mo_energy, Lpq = get_pyscf_input_mol(gw_ml, nocc_act=nocc_act, nvir_act=nvir_act)
+        mybse = BSE(nocc=nocc, mo_energy=mo_energy, Lpq=Lpq)
+
+        # calculate lowest nroot singlet excited states
+        
+        mybse.nroot = nroot
+        exci_s = mybse.kernel('s')[0]
+
+        # calculate BSE oscillator strength in the subspace
+        X_vec = np.zeros((nroot, nocc, nmo - nocc ))
+        Y_vec = np.zeros((nroot, nocc, nmo - nocc))
+
+        start_idx = nocc - nocc_act
+        X_vec[:,start_idx:,:nvir_act] = mybse.X_vec[0]
+        Y_vec[:,start_idx:,:nvir_act] = mybse.Y_vec[0]
+
+        dipole, oscillator_strength = _get_oscillator_strength(multi=mybse.multi, exci=mybse.exci, X_vec=[X_vec], Y_vec=[Y_vec], mo_coeff=mo_coeff[np.newaxis, ...], nocc=[nocc], mol=mf.mol)
+        
+    else:
+        mol = lib.chkfile.load_mol(mlf_chkfile)
+        mf = dft.RKS(mol)
+        mf.xc = xc
+        data = lib.chkfile.load(mlf_chkfile, 'scf')
+        mf.__dict__.update(data)
+        
+        gw_ml = GWAC(mf)
+        # NOTE: gw.mo_energy should be ML QP mo_energy in real MLGF+BSE
+        gw_ml.mo_energy = qpe
+        gw_ml.mo_coeff = mf.mo_coeff
+
+        mybse = BSE(gw_ml)
+
+        mybse.nroot = nroot
+        exci_s = mybse.kernel('s')[0]
+        # print("GW+BSE@PBE0 singlet excitation energy (eV)\n", exci_s*27.211386)
+
+        # calculate BSE oscillator strength
+        dipole, oscillator_strength = mybse.get_oscillator_strength()
+
+
+    return exci_s, dipole, oscillator_strength, bse_active_space
+
+    
+
+def get_properties(sigma, mlf, freqs, eta, properties = 'dq', nroot = 20, ac_method = 'pade', linearized_dm = True, bse_active_space = None, ac_idx = None):
     """Get properties from GW self-energy and DFT calc, self-energy can be from ML or true
 
     Args:
         sigma (np.complex64): self-energy on iomega points
-        mlf (Data): Data.load_chk(mlf_chkfile)
+        mlf (Moldatum): Moldatum.load_chk(mlf_chkfile)
         freqs (np.float64): real freqs to compute DOS
         eta (float): DOS band-broadening
         properties (str, optional): characters for properties to compute (d = dos, q = qpe, = bse, m = density matrix). Defaults to 'dq'.
@@ -77,86 +173,161 @@ def get_properties(
     Returns:
         dict: dictionary of all the computed properties
     """    
-    mlf_chkfile = getattr(mlf, 'fname', None)
-    xc = getattr(mlf, 'xc', 'hf')
-    if type(xc) is bytes:
-        xc = xc.decode('utf-8')
+    mlf_chkfile = mlf.fname
+    xc = getattr(mlf, 'xc', 'hf').decode('utf-8')
     mf_mo_energy = mlf['mo_energy']
     omega_fit = getattr(mlf, 'omega_fit', None)
 
     nmo = len(mf_mo_energy)
     nocc = mlf['nocc']
 
-    if xc == 'hf': 
-        vk_minus_vxc = np.zeros((len(mf_mo_energy), len(mf_mo_energy)))
-    else: 
-        vk, v_mf = get_vmo(mlf)
-        vk_minus_vxc = vk - v_mf
-
     if omega_fit is None:
         omega_fit, _ = get_pade18()
         omega_fit = mlf['ef'] + 1j*omega_fit
 
     if ac_idx is None:
-        ac_idx = np.arange(sigma.shape[-1])
 
-    # analytic continuation
-    if ac_method == 'twopole':
-        acobj = TwoPoleAC(list(range(nmo)), nocc)
-    elif ac_method == 'pade':
-        acobj = PadeAC()
-        acobj.idx = ac_idx
-    elif ac_method == 'pes':
-        raise NotImplementedError
+        omega_ac = getattr(mlf, 'omega_ac', None)
+        if not omega_ac is None:
+            sigma_fit = get_sigma_fit(sigma, omega_fit.imag, omega_ac)
+            omega_fit = omega_ac
+        else:
+            sigma_fit = sigma
+
     else:
-        raise ValueError('Unknown GW-AC type %s' % (str(ac_method)))
+        sigma_fit = sigma[:,:,ac_idx]
+        omega_fit = omega_fit[ac_idx]
+        
+    ef = mlf['ef']
 
-    acobj.ac_fit(sigma, omega_fit, axis=-1)
+    if xc == 'hf': 
+        vk, v_mf = np.zeros((len(mf_mo_energy), len(mf_mo_energy))), np.zeros((len(mf_mo_energy), len(mf_mo_energy)))
+    else: 
+        vk, v_mf = get_vmo(mlf_chkfile, xc = xc)
 
-    outputs = {}
-    if 'q' in properties:
-        qpe = get_quasiparticle_energies(acobj, mf_mo_energy, vk_minus_vxc = vk_minus_vxc)
-        outputs['qpe'] = qpe
-    
-    if 'd' in properties:
-        dos = calc_dos(freqs, eta, acobj, mf_mo_energy, vk_minus_vxc = vk_minus_vxc, diag = diag_dos) # diag 
-        outputs['dos'] = dos
+
+    if ac_method == 'pes':
+        poles, weights = get_poles_weights_pes(sigma, omega_fit, _pes_mmax = 5, _pes_maxiter = 200, _pes_disp = False)
+
+        outputs = {}
+        if 'q' in properties:
+            qpe = get_quasiparticle_energies_pes(omega_fit, poles, weights, vk, v_mf, mf_mo_energy)
+            outputs['qpe'] = qpe
+        
+        if 'd' in properties:
+            dos = calc_dos_pes(freqs, eta, poles, weights, omega_fit, mo_energy, vk_mo-vmf_mo)
+            outputs['dos'] = dos
+        
+    else:
+        sigma_diag = np.diagonal(sigma_fit).T
+        ac_coeff, omega_fit = my_AC_pade_thiele_diag(sigma_diag, omega_fit)
+
+        outputs = {}
+        if 'q' in properties:
+            qpe = get_quasiparticle_energies(omega_fit, ac_coeff, vk, v_mf, mf_mo_energy)
+            outputs['qpe'] = qpe
+        
+        if 'd' in properties:
+            dos = get_dos_orthbasis_diag(freqs, eta, ac_coeff, omega_fit, mf_mo_energy, vk, v_mf) # diag 
+            outputs['dos'] = dos
+
+    if 'b' in properties and 'q' in properties:        
+        if not bse_active_space is None:
+            if type(bse_active_space[0]) == float:
+                top_mo = qpe[nocc] + bse_active_space[1]
+                nocc_act = nocc - sum(qpe < bse_active_space[0])
+
+                nvir_act = nmo - nocc - sum(qpe > top_mo)
+                print(f"BSE (nocc, nvirt) from {bse_active_space[0]} to {top_mo} Hartree: ", nocc_act, nvir_act)
+                bse_active_space = [nocc_act, nvir_act]
+                
+
+
+            else:
+                nocc_act = min(bse_active_space[0], nocc)
+                nvir_act = min(bse_active_space[1], nmo - nocc)
+
+                print("BSE active space (nocc, nvirt): ", nocc_act, nvir_act)
+
+            mol = lib.chkfile.load_mol(mlf_chkfile)
+            mf = dft.RKS(mol)
+            mf.xc = xc
+            data = lib.chkfile.load(mlf_chkfile, 'scf')
+            mf.__dict__.update(data)
+            mf.mol.max_memory=350000
+            mo_coeff = mlf['mo_coeff']
+            
+            gw_ml = GWAC(mf)
+            # NOTE: gw.mo_energy should be ML QP mo_energy in real MLGF+BSE
+            gw_ml.mo_energy = qpe
+            gw_ml.mo_coeff = mf.mo_coeff
+        
+            # get the density fitting integral Lpq for truncated BSE
+            nocc, mo_energy, Lpq = get_pyscf_input_mol(gw_ml, nocc_act=nocc_act, nvir_act=nvir_act)
+            mybse = BSE(nocc=nocc, mo_energy=mo_energy, Lpq=Lpq)
+
+            # calculate lowest nroot singlet excited states
+            print('BSE nroot: ', nroot)
+            mybse.nroot = nroot
+            exci_s = mybse.kernel('s')[0]
+            outputs['bse_exci'] = exci_s # save 
+
+            # calculate BSE oscillator strength in the subspace
+            X_vec = np.zeros((nroot, nocc, nmo - nocc ))
+            Y_vec = np.zeros((nroot, nocc, nmo - nocc))
+
+            start_idx = nocc - nocc_act
+            X_vec[:,start_idx:,:nvir_act] = mybse.X_vec[0]
+            Y_vec[:,start_idx:,:nvir_act] = mybse.Y_vec[0]
+
+            dipole, oscillator_strength = _get_oscillator_strength(multi=mybse.multi, exci=mybse.exci, X_vec=[X_vec], Y_vec=[Y_vec], mo_coeff=mo_coeff[np.newaxis, ...], nocc=[nocc], mol=mf.mol)
+
+            outputs['bse_dipoles'] = dipole # save 
+            outputs['bse_os'] = oscillator_strength # save 
+
+            outputs['bse_active_space'] = bse_active_space
+            
+        else:
+            mol = lib.chkfile.load_mol(mlf_chkfile)
+            mf = dft.RKS(mol)
+            mf.xc = xc
+            data = lib.chkfile.load(mlf_chkfile, 'scf')
+            mf.__dict__.update(data)
+            
+            gw_ml = GWAC(mf)
+            # NOTE: gw.mo_energy should be ML QP mo_energy in real MLGF+BSE
+            gw_ml.mo_energy = qpe
+            gw_ml.mo_coeff = mf.mo_coeff
+
+            mybse = BSE(gw_ml)
+
+            mybse.nroot = nroot
+            exci_s = mybse.kernel('s')[0]
+            # print("GW+BSE@PBE0 singlet excitation energy (eV)\n", exci_s*27.211386)
+            outputs['bse_exci'] = exci_s
+
+            # calculate BSE oscillator strength
+            dipole, oscillator_strength = mybse.get_oscillator_strength()
+            # print("GW+BSE@PBE0 singlet oscillator strength \n", oscillator_strength)
+
+            outputs['bse_dipoles'] = dipole
+            outputs['bse_os'] = oscillator_strength
 
     if 'm' in properties:
         if linearized_dm:
-            outputs['dm'] = get_dm_linear(sigma, mlf['omega_fit'], mlf['wts'], mf_mo_energy, vk_minus_vxc)
+            outputs['dm'] = get_dm_linear(sigma, mlf['omega_fit'], mlf['wts'], mf_mo_energy, vk, v_mf)
         else:
-            outputs['dm'] = get_dm_dyson(sigma, mlf['omega_fit'], mlf['wts'], mf_mo_energy, vk_minus_vxc)
-    
-    if 'b' in properties and 'q' in properties:
-        # raise NotImplementedError("On the fly BSE calculation not available. Use get_bse.py instead.")
-        from mlgf.workflow.get_bse import get_bse_singlets
-        exci_s, dipole, oscillator_strength, bse_active_space = get_bse_singlets(mlf_chkfile, qpe, nmo, nocc, nroot = nroot, bse_active_space = bse_active_space, xc = xc)
-        outputs['bse_exci_s'] = exci_s
-        outputs['bse_dipole'] = dipole
-        outputs['bse_oscillator_strength'] = oscillator_strength
-        outputs['bse_active_space'] = bse_active_space
+            outputs['dm'] = get_ac_dm_dyson(sigma, mlf['omega_fit'], mlf['wts'], mf_mo_energy, vk, v_mf)
 
+    
     return outputs
 
-def get_properties_cc(
-    sigma,
-    mlf,
-    freqs,
-    eta,
-    properties="d",
-    frozen=None,
-    no_thresh=1e-4,
-    ac_idx=None,
-    z_idx=[0, 3],
-    do_comparisons=False,
-    ac_method="pade",
-):
+def get_properties_cc(sigma, mlf, freqs, eta, properties = 'd', frozen = None, no_thresh = 1e-4, ac_idx = None, z_idx = [0, 3], do_comparisons = False):
     """Get properties from CC self-energy and DFT calc, self-energy can be from ML or true
 
     Args:
         sigma (np.complex64): self-energy on iomega points
-        mlf (Data): Data.load_chk(mlf_chkfile)
+        mlf (Moldatum): Moldatum.load_chk(mlf_chkfile)
         freqs (np.float64): real freqs to compute DOS
         eta (float): DOS band-broadening
         properties (str, optional): characters for properties to compute (d = dos, e = FNO energies, m = density matrix). Defaults to 'd'.
@@ -169,49 +340,32 @@ def get_properties_cc(
     Returns:
         dict: dictionary of all the computed properties
     """    
-    xc = getattr(mlf, 'xc', 'hf')
-    if type(xc) is bytes:
-        xc = xc.decode('utf-8')
+    xc = getattr(mlf, 'xc', 'hf').decode('utf-8')
     mf_mo_energy = mlf['mo_energy']
     omega_fit = mlf['omega_fit']
-    nmo, nocc = len(mf_mo_energy), mlf['nocc']
-
-    if omega_fit is None:
-        omega_fit, _ = get_pade18()
-        omega_fit = mlf['ef'] + 1j*omega_fit
-
+    ef = mlf['ef']
+    # default_ac_idx = [0, 3, 4, 5, 7, 8, 10, 11, 13, 14, 15, 17, 18, 20, 21, 22, 23, 24]
+    # default_ac_idx = np.arange(len(omega_fit))
+    # ac_idx = getattr(mlf, 'ac_idx', default_ac_idx)
     if ac_idx is None:
-        ac_idx = np.arange(sigma.shape[-1])
+        ac_idx = np.arange(len(omega_fit))
 
-    # analytic continuation
-    if ac_method == 'twopole':
-        acobj = TwoPoleAC(list(range(nmo)), nocc)
-    elif ac_method == 'pade':
-        acobj = PadeAC()
-        acobj.idx = ac_idx
-    elif ac_method == 'pes':
-        raise NotImplementedError
-    else:
-        raise ValueError('Unknown GW-AC type %s' % (str(ac_method)))
+    nmo, nocc = len(mlf['mo_energy']), mlf['nocc']
+    
 
-    acobj.ac_fit(sigma, omega_fit, axis=-1)
-
-    if xc == 'hf': 
-        vk_minus_vxc = np.zeros((len(mf_mo_energy), len(mf_mo_energy)))
-    else: 
-        vk, v_mf = get_vmo(mlf)
-        vk_minus_vxc = vk - v_mf
+    if xc == 'hf': vk, v_mf = np.zeros((len(mf_mo_energy), len(mf_mo_energy))), np.zeros((len(mf_mo_energy), len(mf_mo_energy)))
+    else: vk, v_mf = get_vmo(mlf_chkfile, xc = xc)
 
     outputs = {}
     outputs['no_thresh'] = no_thresh
     if 'd' in properties:
-        dos = calc_dos(freqs, eta, acobj, mf_mo_energy, vk_minus_vxc=vk_minus_vxc, diag=False)
+        dos = calc_dos(freqs, eta, ac_coeff, omega_fit, mf_mo_energy, vk_minus_vxc=vk-v_mf, diag=False)
         outputs['dos'] = dos
 
         
     if 'm' in properties:
 
-        outputs['dm'] = get_dm_dyson(sigma, omega_fit, mlf['wts'], mf_mo_energy, vk_minus_vxc)
+        outputs['dm'] = get_ac_dm_dyson(sigma, omega_fit, mlf['wts'], mf_mo_energy, vk, v_mf)
 
         # frozen NOs from CCGF
         if 'e' in properties:
@@ -250,18 +404,17 @@ def get_properties_cc(
 
 
         # frozen MOs
-        # TODO: fix this frozen MO part (though not used much in practice)
-        # if 'e' in properties and do_comparisons:
-        #     mol = lib.chkfile.load_mol(mlf.fname)
-        #     mol.verbose = 5
-        #     mf = scf.RHF(mol)
-        #     # frozen = np.array([0, 1, 2] + list(frozen))
-        #     mf.__dict__.update(lib.chkfile.load(mlf.fname, 'scf'))
-        #     frozen = frozen[frozen_start:]
-        #     mycc = cc.CCSD(mf, frozen=frozen)
-        #     mycc.kernel()
-        #     outputs['e_ccsd_mo_frozen'] = mycc.e_tot
-        #     outputs['et_ccsdt_mo_frozen'] = mycc.ccsd_t()
+        if 'e' in properties and do_comparisons:
+            mol = lib.chkfile.load_mol(mlf.fname)
+            mol.verbose = 5
+            mf = scf.RHF(mol)
+            # frozen = np.array([0, 1, 2] + list(frozen))
+            mf.__dict__.update(lib.chkfile.load(mlf.fname, 'scf'))
+            frozen = frozen[frozen_start:]
+            mycc = cc.CCSD(mf, frozen=frozen)
+            mycc.kernel()
+            outputs['e_ccsd_mo_frozen'] = mycc.e_tot
+            outputs['et_ccsdt_mo_frozen'] = mycc.ccsd_t()
         
         # release pyscf memory
         if 'e' in properties:
@@ -297,17 +450,17 @@ def do_validation_gw(job):
     ac_idx = job['ac_idx']
 
     out_dict = {}
-    model_obj = joblib.load(model_file)
-    sigma_ml = model_obj.predict_full_sigma(mlf_chkfile)
+    gnn_orch = joblib.load(model_file)
+    sigma_ml = gnn_orch.predict_full_sigma(mlf_chkfile)
     if save_sigma:
         out_dict[f'sigma_ml_{basis_name}'] = sigma_ml
-        uncertainty = getattr(model_obj, "uncertainty_full_sigma", None)
-        if uncertainty is not None:
+        uncertainty = getattr(model, "uncertainty_full_sigma", None)
+        if not uncertainty is None:
             if callable(uncertainty):
-                sigma_ml_uncertainty = model_obj.uncertainty_full_sigma(mlf_chkfile, remount_mlf_chkfile = False)
+                sigma_ml_uncertainty = gnn_orch.uncertainty_full_sigma(mlf_chkfile, remount_mlf_chkfile = False)
                 out_dict['sigma_ml_uncertainty'] = sigma_ml_uncertainty
 
-    mlf = model_obj.pdset[0]
+    mlf = gnn_orch.pdset[0]
     C_lo_mo = mlf[f'C_{basis_name}_mo']
     
     sigma_ml = sigma_lo_mo(sigma_ml, C_lo_mo) 
@@ -357,19 +510,22 @@ def do_validation_cc(job):
     no_thresh = job.get('no_thresh', 1e-3)
     ac_idx = job.get('ac_idx', None)
     z_idx = job.get('z_idx', [0, 3])
+    
+    linearized_dm = job['linearized_dm']
+    bse_active_space, bse_nroot = job['bse_active_space'], job['bse_nroot']
 
     out_dict = {}
-    model_obj = joblib.load(model_file)
-    sigma_ml = model_obj.predict_full_sigma(mlf_chkfile)
+    gnn_orch = joblib.load(model_file)
+    sigma_ml = gnn_orch.predict_full_sigma(mlf_chkfile)
     if save_sigma:
         out_dict[f'sigma_ml_{basis_name}'] = sigma_ml
-        uncertainty = getattr(model_obj, "uncertainty_full_sigma", None)
-        if uncertainty is not None:
+        uncertainty = getattr(model, "uncertainty_full_sigma", None)
+        if not uncertainty is None:
             if callable(uncertainty):
-                sigma_ml_uncertainty = model_obj.uncertainty_full_sigma(mlf_chkfile, remount_mlf_chkfile = False)
+                sigma_ml_uncertainty = gnn_orch.uncertainty_full_sigma(mlf_chkfile, remount_mlf_chkfile = False)
                 out_dict['sigma_ml_uncertainty'] = sigma_ml_uncertainty
 
-    mlf = model_obj.pdset[0]
+    mlf = gnn_orch.pdset[0]
     C_lo_mo = mlf[f'C_{basis_name}_mo']
 
     sigma_ml = sigma_lo_mo(sigma_ml, C_lo_mo) 
@@ -405,7 +561,7 @@ def do_validation_cc(job):
     out_dict['xc'] = getattr(mlf, 'xc', 'hf')#.decode('utf-8')
     out_dict['ef'] = mlf['ef']
     lib.chkfile.save(out_fname, validation_name, out_dict)
-    del model_obj
+    del gnn_orch
     
 
 def predict_sigma(model_file, mlf_chkfile, return_uncertainty = False):
@@ -448,8 +604,8 @@ def make_outputs(jobs, defaults):
 def make_outputs_mpi(jobs, defaults):
     indices = np.arange(len(jobs))
     indices_subset = indices[indices % size == rank]
-    # jobs_rank = [jobs[i] for i in range(len(jobs)) if i % size == rank]
-    make_outputs(jobs[indices_subset], defaults)
+    jobs_rank = [jobs[i] for i in range(len(jobs)) if i % size == rank]
+    make_outputs(jobs_rank, defaults)
     
 def generate_validation_queue(model_files, validation_dir, output_dir):
     validation_data = []
@@ -498,6 +654,11 @@ if __name__ == '__main__':
     json_spec = args.json_spec
     no_new_folders = args.no_new_folders
 
+    from mpi4py import MPI
+    rank = MPI.COMM_WORLD.Get_rank()
+    size = MPI.COMM_WORLD.Get_size()
+    comm = MPI.COMM_WORLD
+
     defaults = {'pts' : 201, 'eta' : 0.01, 'basis_name' : 'saiao', 'properties' : 'dq', 'zero_coulomb' : False, 'zero_core' : False, 'save_sigma' : False, 'linearized_dm' : True, 'bse_nroot' : 10, 'gf' : 'gw', 'no_thresh' : 1e-3, 'ac_idx' : None, 'z_idx' : [0, 3]}
 
     assert('.json' in json_spec)
@@ -532,7 +693,6 @@ if __name__ == '__main__':
         defaults['no_thresh'] = spec.get('no_thresh', defaults['no_thresh'])
         defaults['ac_idx'] = spec.get('ac_idx', defaults['ac_idx'])
         defaults['z_idx'] = spec.get('z_idx', defaults['z_idx'])
-        defaults['basis_name'] = spec.get('basis_name', defaults['basis_name'])
         
         comm.Barrier()
         if type(input_dir) == list:

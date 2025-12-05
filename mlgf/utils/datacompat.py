@@ -4,7 +4,7 @@ from pathlib import Path
 import warnings
 import joblib
 import pyscf
-from mlgf.data import Data
+from mlgf.data import Moldatum
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='datacompat.py')
@@ -29,7 +29,7 @@ if __name__ == '__main__':
         for j, chk, cchk in zip(joblibs, pyscf_checkfiles, custom_checkfiles):
             mdt_file_path = srcpath.joinpath(f'{j.stem}.mdt')
             dic = joblib.load(j)
-            mdt = Data(dic)
+            mdt = Moldatum(dic)
             
             mol = pyscf.lib.chkfile.load_mol(chk)
             pyscfdata = pyscf.lib.chkfile.load(chk, 'scf')

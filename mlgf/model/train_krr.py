@@ -1,3 +1,7 @@
+
+from mlgf.model.krr_orchestrator import KRROrchestrator
+from mlgf.data import Dataset, Moldatum
+
 import os
 import numpy as np
 import argparse
@@ -6,9 +10,6 @@ import time
 import warnings
 import psutil
 import json
-
-from mlgf.model.sklearn_model import SKL_Model
-from mlgf.data import Dataset, Data
 
 from mpi4py import MPI
 rank = MPI.COMM_WORLD.Get_rank()
@@ -31,7 +32,7 @@ ij_chunk_size, max_mem = None, dset_file = None):
     gc.collect()
 
     t0 = time.time()
-    model = SKL_Model(feat_list_ii, feat_list_ij, target, exclude_core = exclude_core, coulomb_screen_tol = coulomb_screen, coulomb_screen_basis = coulomb_screen_basis, 
+    model = KRROrchestrator(feat_list_ii, feat_list_ij, target, exclude_core = exclude_core, coulomb_screen_tol = coulomb_screen, coulomb_screen_basis = coulomb_screen_basis, 
     max_mem = max_mem, ij_chunk_size = ij_chunk_size, dyn_imag_freq_points = dyn_imag_freq_points)
     model.fit(dset)
     t = time.time() - t0
@@ -74,8 +75,8 @@ if __name__ == '__main__':
     json_spec = args.json_spec
     no_new_folders = args.no_new_folders
     defaults = {'exclude_core' : False, 'coulomb_screen_basis' : 'saiao', 'coulomb_screen' : 0.05, 'target': 'sigma_saiao',
-         'feat_list_ii' : ["dm_saiao", "fock_saiao", "hcore_saiao", "vj_saiao", "vxc_saiao", "gf_dyn", "hyb_dyn"],
-     'feat_list_ij' : ["dm_saiao", "fock_saiao", "hcore_saiao", "vj_saiao", "vxc_saiao", "gf_dyn", "hyb_dyn_off"],
+         'feat_list_ii' : ["dm_saiao", "fock_saiao", "hcore_saiao", "vj_saiao", "vxc_saiao", "gf_dyn_im", "hyb_dyn_im"],
+     'feat_list_ij' : ["dm_saiao", "fock_saiao", "hcore_saiao", "vj_saiao", "vxc_saiao", "gf_dyn_im", "hyb_dyn_off_im"],
     'ij_chunk_size' : 1e3, 'max_mem' : 5000}
 
     assert('.json' in json_spec)

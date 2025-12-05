@@ -1,4 +1,4 @@
-from mlgf.lib.dos_helper import get_dos_hf
+from mlgf.lib.doshelper import get_dos_hf
 from mlgf.lib.dm_helper import get_dipole, scalar_quadrupole, dm_mo_to_ao
 import os
 import numpy as np
@@ -66,19 +66,15 @@ def validations_to_table(validation_files, validation_names, do_dm = False):
             data_dict['file_name'].append(validation_file)
             data_dict['validation_name'].append(validation_name)
 
-            if do_dm:
+            if 'dm_ml' in out.keys():
                 # print(f'computing dipoles on rank {rank} for {validation_file}')
                 if compute_reference_vals:
-                    mlf_chkfile = out['mlf_chkfile']
-                    if type(mlf_chkfile) is bytes:
-                        mlf_chkfile = mlf_chkfile.decode('utf-8')
+                    mlf_chkfile = out['mlf_chkfile'].decode('utf-8')
                     mlf = lib.chkfile.load(mlf_chkfile, 'mlf')
                     mol = lib.chkfile.load_mol(mlf_chkfile)
 
                     rks = dft.RKS(mol)
-                    rks.xc = mlf['xc']
-                    if type(rks.xc) is bytes:
-                        rks.xc = rks.xc.decode('utf-8')
+                    rks.xc = mlf['xc'].decode('utf-8')
                     scf_data = lib.chkfile.load(mlf_chkfile, 'scf')
                     rks.__dict__.update(scf_data)
                     

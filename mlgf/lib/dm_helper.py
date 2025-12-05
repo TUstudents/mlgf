@@ -1,54 +1,35 @@
+from mlgf.lib.gfhelper import pade_thiele_ndarray, my_AC_pade_thiele_full
+from mlgf.lib.helpers import sigma_lo_mo
 from pyscf import lib
-from mlgf.lib.dos_helper import get_g0
+
+from fcdmft.gw.mol.gw_ac import _get_scaled_legendre_roots, mkslice
+from mlgf.lib.helpers import get_g0
 import numpy as np
 from pyscf import data
 
 einsum = lib.einsum
 
 def dm_mo_to_ao(dm_mo, coeff):
-    """Rotate MO dm to AO
-
-    Parameters
-    ----------
-    dm_mo : float64 2d array
-        MO
-    coeff : float64 2d array
-        MO coefficients
-
-    Returns
-    -------
-    float64 2d array
-        AO rdm1
-    """    
     return np.dot(coeff, dm_mo).dot(coeff.T)
 
 def make_frozen_no(dm, mo_energy, mo_coeff, nocc, thresh=1e-6, pct_occ=None, nvir_act=None):
-    """Frozen natural orbitals
+    r'''
+    Frozen natural orbitals
 
-    Parameters
-    ----------
-    dm : float64 2d array
-        MO density matrix
-    mo_energy : float64 1d array
-        MO energy
-    mo_coeff : float64 2d array
-        MO coefficients
-    nocc : int
-        number of docc orbitals
-    thresh : float, optional
-        Threshold on NO occupation numbers. Default is 1e-6 (very conservative).
-    pct_occ : float, optional
-        Percentage of total occupation number. Default is None. If present, overrides `thresh`.
-    nvir_act : int, optional
-        Number of virtual NOs to keep. Default is None. If present, overrides `thresh` and `pct_occ`.
+    Attributes:
+        thresh : float
+            Threshold on NO occupation numbers. Default is 1e-6 (very conservative).
+        pct_occ : float
+            Percentage of total occupation number. Default is None. If present, overrides `thresh`.
+        nvir_act : int
+            Number of virtual NOs to keep. Default is None. If present, overrides `thresh` and `pct_occ`.
 
-    Returns
-    -------
-    frozen : list or ndarray
+    Returns:
+        frozen : list or ndarray
             List of orbitals to freeze
-    no_coeff : ndarray
-        Semicanonical NO coefficients in the AO basis
-    """    
+        no_coeff : ndarray
+            Semicanonical NO coefficients in the AO basis
+    '''
 
     nmo = len(mo_coeff)
 
@@ -79,19 +60,6 @@ def make_frozen_no(dm, mo_energy, mo_coeff, nocc, thresh=1e-6, pct_occ=None, nvi
 
 # do not use mol.dip_moment, its slow
 def get_dipole(mf, dm_ao):
-    """dipole
-
-    Parameters
-    ----------
-    mf : pyscf mf object
-    dm_ao : float64 2d array
-        AO rdm1
-
-    Returns
-    -------
-    float
-        dipole
-    """    
     return np.linalg.norm(mf.dip_moment(dm = dm_ao, verbose = 0))
 
 def traceless_quadrupole(mol, dm, units="AU", charge_center_origin=True):
@@ -173,68 +141,27 @@ def scalar_quadrupole(mol, dm, units="SI", charge_center_origin=True):
     evs, _ = np.linalg.eigh(tot_q_traceless)
     return (evs[-1] - evs[0]) / 2
 
-def get_dm_linear(sigma, dm_freqs, dm_wts, mo_energy, vk_minus_vxc):
-    """Get GW density matrix from G(it=0).
-    G(it=0) = \int G(iw) dw
-    As shown in doi.org/10.1021/acs.jctc.0c01264, calculate G0W0 Green's function using Dyson equation is not
-    particle number conserving.
-    The linear mode G = G0 + G0 Sigma G0 is particle number conserving.
-
-    Parameters
-    ----------
-    sigma : complex128
-        sigmaI
-    dm_freqs : complex128
-        imaginary frequencies that sigma is evaluated on
-    dm_wts : float64
-        Gauss-Legendre integration weights for dm_freqs
-    mo_energy : float64
-        DFT MO energies
-    vk_minus_vxc : float64
-        static self-energy from DFT/HF
-
-    Returns
-    -------
-    rdm1 : double 2d array
-        one-particle density matrix
-    """    
+# no ac
+def get_dm_linear(sigma, dm_freqs, dm_wts, mo_energy, vk, v_mf):
     nw, nmo = sigma.shape[-1], len(mo_energy)
     
     gf0 = get_g0(dm_freqs, mo_energy, 0.)
 
     gf = np.zeros_like(gf0)
     for iw in range(gf.shape[-1]):
-        gf[:,:,iw] = gf0[:,:,iw] + np.dot(gf0[:,:,iw], (vk_minus_vxc + sigma[:,:,iw])).dot(gf0[:,:,iw])
+        gf[:,:,iw] = gf0[:,:,iw] + np.dot(gf0[:,:,iw], (vk + sigma[:,:,iw] - v_mf)).dot(gf0[:,:,iw])
     
     # gf = gf0 + np.einsum('ijw,jkw,klw->ilw', gf0, vk_minus_vxc + sigma_dm_grid, gf0, optimize = True) # slow
     rdm1 = 2./np.pi * einsum('ijw,w->ij',gf,dm_wts) + np.eye(nmo)
     return rdm1.real
 
-def get_dm_dyson(sigma, dm_freqs, dm_wts, mo_energy, vk_minus_vxc):
-    """Get CC density matrix from G(it=0) with full Dyson equation.
-    G(it=0) = \int G(iw) dw
-
-    Parameters
-    ----------
-    sigma : complex128
-        sigmaI
-    dm_freqs : complex128
-        imaginary frequencies that sigma is evaluated on
-    dm_wts : float64
-        Gauss-Legendre integration weights for dm_freqs
-    mo_energy : float64
-        DFT MO energies
-    vk_minus_vxc : float64
-        static self-energy from DFT/HF
-
-    Returns
-    -------
-    rdm1 : double 2d array
-        one-particle density matrix
-    """   
+# smaller number of omega_fit points, needs AC
+def get_ac_dm_dyson(sigma, dm_freqs, dm_wts, mo_energy, vk, v_mf):
     nw, nmo = dm_freqs.shape[0], len(mo_energy)
     
     gf0 = get_g0(dm_freqs, mo_energy, 0.)
-    gf = np.linalg.inv(np.linalg.inv(gf0.T) - (np.expand_dims(vk_minus_vxc, -1) + sigma).T).T
+    vk_minus_vxc = vk - v_mf
+    vk_minus_vxc = np.expand_dims(vk_minus_vxc, -1)
+    gf = np.linalg.inv(np.linalg.inv(gf0.T) - (vk_minus_vxc + sigma).T).T
     rdm1 = 2./np.pi * einsum('ijw,w->ij',gf,dm_wts) + np.eye(nmo)
     return rdm1.real

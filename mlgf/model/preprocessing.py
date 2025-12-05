@@ -1,6 +1,7 @@
 from sklearn.preprocessing import MinMaxScaler, PowerTransformer, StandardScaler, RobustScaler
-# from sklearn import cluster, mixture
+from sklearn import cluster, mixture
 import numpy as np
+import torch
 
 # https://notmatthancock.github.io/2017/03/23/simple-batch-stat-updates.html
 def batched_std_update(std1, std2, mean1, mean2, n1, n2):  

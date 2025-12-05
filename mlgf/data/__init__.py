@@ -36,5 +36,5 @@ Example::
 """
 
 from ._dataset import Dataset
-from ._data import Data
-__all__ = ['Dataset', 'Data']
+from ._moldatum import Moldatum
+__all__ = ['Dataset', 'Moldatum']

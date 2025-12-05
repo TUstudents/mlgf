@@ -1,23 +1,29 @@
-import os
-import argparse
-import joblib
-import json
-import gc
-
-import torch
-import numpy as np
-import pandas as pd
+# from mlgf.model.multimodal_model import MultiModalModel
+from mlgf.model.gnn_orchestrator import GraphOrchestrator, MoldatumDsetBatcher
 
 from mlgf.model.pytorch.pt_alias import get_model_from_alias
-from mlgf.model.pytorch.train import train_graph_model, train_refine_graph_model
+from mlgf.model.pytorch.train import train_graph_model
+from mlgf.workflow.get_ml_info import make_outputs_mpi
 from mlgf.model.active_learning import get_homo_lumo_uncertainties_train_examples
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-from mpi4py import MPI
-rank = MPI.COMM_WORLD.Get_rank()
-size = MPI.COMM_WORLD.Get_size()
-comm = MPI.COMM_WORLD
+from mlgf.data import Dataset, Moldatum
 
-def train_graph_ensemble_mpi(gnn_orch_file, seeds, train_config, initial_model_states = None, debug = False, safer_memory = False):
+import os
+import numpy as np
+import argparse
+import joblib
+import time
+import warnings
+import psutil
+import json
+import copy
+import gc
+import shutil
+
+def train_graph_ensemble_mpi(gnn_orch_file, seeds, train_config, initial_model_states = None, debug = False):
     """train an ensemble of MBGF-Net on mpi procs
 
     Args:
@@ -32,7 +38,7 @@ def train_graph_ensemble_mpi(gnn_orch_file, seeds, train_config, initial_model_s
     gnn_orch = joblib.load(gnn_orch_file)
     model_kwargs = gnn_orch.model_kwargs
     loss_kwargs = gnn_orch.loss_kwargs
-    model_alias = getattr(gnn_orch, 'model_alias')
+    model_alias = getattr(gnn_orch, f'model_alias')
     
     for i in range(len(seeds)):
         if i % size == rank:
@@ -42,15 +48,19 @@ def train_graph_ensemble_mpi(gnn_orch_file, seeds, train_config, initial_model_s
         pt_file = gnn_orch_file.replace('.joblib', f'_{i}.pt')        
         model = get_model_from_alias(model_alias, **model_kwargs)
 
-        if initial_model_states is not None:
+        if not initial_model_states is None:
             model.load_state_dict(initial_model_states[i])
-        if type(train_config) is list:
+        if type(train_config) == list:
             for c, config in enumerate(train_config):
+                optimizer_name = config.get('optimizer', 'Adam').lower()
                 if c != 0:
                     state_dict = torch.load(pt_file, map_location=torch.device('cpu'))
                     model.load_state_dict(state_dict)
-                
-                model_i = train_graph_model(gnn_orch.data, model, config, seed = seeds[i], loss_kwargs = loss_kwargs, rank = rank)
+                if optimizer_name == 'lbfgs':
+                    model_i = train_graph_model_lbfgs(gnn_orch.data, model, config, seed = seeds[i], loss_kwargs = loss_kwargs, rank = rank)
+                else:
+                    model_i = train_graph_model(gnn_orch.data, model, config, seed = seeds[i], loss_kwargs = loss_kwargs, rank = rank)
+
                 torch.save(model_i.state_dict(), pt_file)
         else:
             log_dir = train_config.get('log_dir', None)
@@ -73,7 +83,7 @@ def refine_graph_ensemble_mpi(gnn_orch_file, seeds, train_config, uncertainty_so
     """    
     
     gnn_orch = joblib.load(gnn_orch_file)
-    uncertainty_csv = gnn_orch_file.replace('.joblib', '_uncertainties.csv')
+    uncertainty_csv = gnn_orch_file.replace('.joblib', f'_uncertainties.csv')
 
     if not os.path.isfile(uncertainty_csv):
         indices = np.arange(len(gnn_orch.data))
@@ -94,7 +104,7 @@ def refine_graph_ensemble_mpi(gnn_orch_file, seeds, train_config, uncertainty_so
     out_tasks = []
     model_kwargs = gnn_orch.model_kwargs
     loss_kwargs = gnn_orch.loss_kwargs
-    model_alias = getattr(gnn_orch, 'model_alias')
+    model_alias = getattr(gnn_orch, f'model_alias')
     for i in range(len(seeds)):
         if i % size == rank:
             out_tasks.append(i)
@@ -132,7 +142,7 @@ def collect_models(gnn_orch_file, n):
         state_dict = torch.load(pt_file, map_location=torch.device('cpu'))
         state_dicts.append(state_dict)
 
-    setattr(gnn_orch, 'model_states', state_dicts)
+    setattr(gnn_orch, f'model_states', state_dicts)
     
     gnn_orch.dump(gnn_orch_file)
 
@@ -150,7 +160,7 @@ def collect_models_refined(gnn_orch_file, n):
         state_dict = torch.load(pt_file, map_location=torch.device('cpu'))
         state_dicts.append(state_dict)
 
-    setattr(gnn_orch, 'model_states', state_dicts)
+    setattr(gnn_orch, f'model_states', state_dicts)
     gnn_orch_file = gnn_orch_file.replace('.joblib', '_refined.joblib')
     gnn_orch.dump(gnn_orch_file)
 
@@ -163,7 +173,6 @@ if __name__ == '__main__':
     parser.add_argument('--debug', action = 'store_true', help='use the debug training function')
     parser.add_argument('--strong', action = 'store_true', help='magnitude splitting of self-energy')
     parser.add_argument('--torch_max_split', required = False, help='integer, env variable max_split_size_mb in MB')
-    parser.add_argument('--safer_memory', required = False, action = 'store_true', help='safer memory use by GPU for large systems')
 
     args = parser.parse_args()
     json_spec = args.json_spec
@@ -171,7 +180,12 @@ if __name__ == '__main__':
     active_refinement = args.active_refinement
     torch_max_split = args.torch_max_split
 
-    if torch_max_split is not None:
+    from mpi4py import MPI
+    rank = MPI.COMM_WORLD.Get_rank()
+    size = MPI.COMM_WORLD.Get_size()
+    comm = MPI.COMM_WORLD
+
+    if not torch_max_split is None:
         os.environ["PYTORCH_CUDA_ALLOC_CONF"] = f"max_split_size_mb:{torch_max_split}"
 
     assert('.json' in json_spec)
@@ -190,7 +204,7 @@ if __name__ == '__main__':
                 raise FileExistsError(f'{outdir} exists but is not a directory')
                 comm.Abort()
 
-        if gnn_orch_file_to_copy is not None:
+        if not gnn_orch_file_to_copy is None:
             gnn_orch = joblib.load(gnn_orch_file_to_copy)
         else:
             gnn_orch = joblib.load(gnn_orch_file)
@@ -211,13 +225,13 @@ if __name__ == '__main__':
     ensemble_n = job.get('ensemble_n', 1)
     seeds = list(range(42, 42 + ensemble_n))
     initial_state_src = job.get('initial_state_src', None)
-    if initial_state_src is not None:
+    if not initial_state_src is None:
         initial_model_states = joblib.load(initial_state_src).model_states
     else:
         initial_model_states = None
 
     comm.Barrier()
-    train_graph_ensemble_mpi(gnn_orch_file, seeds, train_config, initial_model_states = initial_model_states, debug = args.debug, safer_memory = args.safer_memory)
+    train_graph_ensemble_mpi(gnn_orch_file, seeds, train_config, initial_model_states = initial_model_states, debug = args.debug)
     print(f'Rank {rank} finished training!', flush = True)
     comm.Barrier()
 
@@ -227,8 +241,10 @@ if __name__ == '__main__':
         
     comm.Barrier()
     train_config_active = job.get('train_config_active', None)
-    if train_config_active is not None:
+    if not train_config_active is None:
         refine_graph_ensemble_mpi(gnn_orch_file, seeds, train_config_active)
         comm.Barrier()
         if rank == 0:
             collect_models_refined(gnn_orch_file, ensemble_n)
+
+    MPI.Finalize()

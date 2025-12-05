@@ -1,7 +1,7 @@
 import os
 import numpy as np
 import pandas as pd
-from ._data import Data
+from ._moldatum import Moldatum
 import pathlib
 import re
 import warnings
@@ -21,7 +21,7 @@ def get_conf_nums(fnames):
     
 
 class Dataset:
-    """Holds a list of data from DFT and/or GW calculations as Data for each DFT or DFT+GW calculation
+    """Holds a list of data from DFT and/or GW calculations as Moldatum for each DFT or DFT+GW calculation
     Attributes:
         fnames (list): List of names of data files
         loaded (dict): Dictionary containing loaded data
@@ -31,7 +31,7 @@ class Dataset:
     _format_extension_tbl = {'joblib': '.joblib', 'internal': '.mdt', 'chk' : '.chk'}
     
     
-    def __init__(self, iterable, loaded = {}, data_format = 'chk', preserve_order=True, load_data = True, purge_keys = [], core_projection_file_path = None, basis = 'saiao'):
+    def __init__(self, iterable, loaded = {}, data_format = 'chk', preserve_order=True, load_data = True, purge_keys = [], core_projection_file_path = None):
         if preserve_order:
             self.fnames = list(iterable)
         else:
@@ -39,7 +39,6 @@ class Dataset:
         self.conf_nums = list(get_conf_nums(self.fnames))
         self.conf_nums_to_fnames = dict(zip(self.conf_nums, self.fnames))
         self.purge_keys = purge_keys
-        self.basis = basis
        
         self.confs_are_unique = (len(self.conf_nums_to_fnames) == len(self.conf_nums))
         
@@ -57,6 +56,7 @@ class Dataset:
             self.val_core_dats = [minao_val, minao_core]
         else:
             self.val_core_dats = None
+        # print(self.val_core_dats)
 
     
     def get_by_fname(self, fname):
@@ -64,11 +64,11 @@ class Dataset:
             return self.loaded[fname]
         else:
             if self.data_format == 'joblib':
-                dat = Data.load_joblib(fname)
+                dat = Moldatum.load_joblib(fname)
             elif self.data_format == 'chk':
-                dat = Data.load_chk(fname, purge_keys = self.purge_keys, val_core_dats = self.val_core_dats, basis = self.basis)
+                dat = Moldatum.load_chk(fname, purge_keys = self.purge_keys, val_core_dats = self.val_core_dats)
             elif self.data_format == 'internal':
-                dat = Data.load(fname)
+                dat = Moldatum.load(fname)
             else:
                 raise ValueError(f'Unknown data format {self.data_format}; acceptable values are {Dataset._format_extension_tbl.keys()}')
             if self.load_data:
@@ -96,8 +96,8 @@ class Dataset:
         return (self.get_by_fname(fname) for fname in self.fnames)
     
     @staticmethod
-    def from_files(file_list, dropout_files = [], data_format = 'chk', load_data = True, purge_keys = [], core_projection_file_path = None, basis = 'saiao'):
-        return Dataset([filename for filename in file_list if filename not in dropout_files], data_format=data_format, load_data = load_data, purge_keys = purge_keys, core_projection_file_path = core_projection_file_path, basis = basis)
+    def from_files(file_list, dropout_files = [], data_format = 'chk', load_data = True, purge_keys = [], core_projection_file_path = None):
+        return Dataset([filename for filename in file_list if filename not in dropout_files], data_format=data_format, load_data = load_data, purge_keys = purge_keys, core_projection_file_path = core_projection_file_path)
             
     @staticmethod
     def from_srcdirectory(src, dropout_files = [], data_format = 'chk'):
