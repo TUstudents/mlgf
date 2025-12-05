@@ -38,6 +38,7 @@ dependencies = [
     # Quantum chemistry
     "pyscf>=1.7",
     "fcdmft>=0.1.0",  # Local dependency
+    "libdmet @ git+https://github.com/gkclab/libdmet_preview.git",
 
     # Machine learning
     "scikit-learn>=0.22",
