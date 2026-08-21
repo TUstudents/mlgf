@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Experiment 0: actual IP-EOM-DSRG flow-parameter sweep on the public NiuPy BeH2 test.
 
-This is an end-to-end execution test of the published software stack.  The
+This is an end-to-end execution test of the published software stack. The
 same small basis is also solved by full CI (PySCF) so the s-dependence can be
 scored against an exact-in-basis charged spectrum rather than against another
 approximate method.
+
+The public NiuPy s=0.5 regression is a hard precondition: no other flow
+parameter is evaluated unless that regression first passes.
 """
 from __future__ import annotations
 
 import argparse
-import csv
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +22,7 @@ import pandas as pd
 from scipy.optimize import linear_sum_assignment
 
 EV = 27.211386245988
+REGRESSION_S = 0.50
 S_VALUES = [0.0, 0.01, 0.05, 0.10, 0.25, 0.35, 0.50, 0.75, 1.00, 1.25]
 TEST_IPS = np.array([11.0712299825, 12.9096937411, 17.2339756217, 17.3971330715])
 TEST_SPECS = np.array([1.97180714, 1.95473561, 0.0, 0.00213609])
@@ -124,7 +126,7 @@ def run_case(s: float, workdir: Path) -> dict:
 
 
 def exact_fci_reference(outdir: Path, nroots: int = 24) -> pd.DataFrame:
-    from pyscf import gto, scf, ao2mo, fci
+    from pyscf import ao2mo, fci, gto, scf
 
     x = 1.0
     mol = gto.M(
@@ -143,7 +145,7 @@ def exact_fci_reference(outdir: Path, nroots: int = 24) -> pd.DataFrame:
     C = mf.mo_coeff
     norb = C.shape[1]
     hcore = C.T @ mf.get_hcore() @ C
-    eri = ao2mo.kernel(mol, C, compact=False).reshape((norb,)*4)
+    eri = ao2mo.kernel(mol, C, compact=False).reshape((norb,) * 4)
     ecore = mol.energy_nuc()
 
     solver_n = fci.direct_spin1.FCI(mol)
@@ -156,10 +158,12 @@ def exact_fci_reference(outdir: Path, nroots: int = 24) -> pd.DataFrame:
     if not isinstance(cic, (list, tuple)):
         cic = [cic]
 
+    # Closed-shell singlet: alpha removal gives the M_s=-1/2 doublet component.
+    # Multiplying by two yields the spin-summed removal strength.
     annih = [fci.addons.des_a(ci0, norb, (3, 3), p) for p in range(norb)]
     rows = []
     for k, (ek, cik) in enumerate(zip(ec, cic), start=1):
-        alpha_weight = sum(abs(np.vdot(cik, v))**2 for v in annih)
+        alpha_weight = sum(abs(np.vdot(cik, v)) ** 2 for v in annih)
         spin_summed_weight = 2.0 * float(alpha_weight)
         try:
             ss, mult = solver_c.spin_square(cik, norb, (2, 3))
@@ -184,9 +188,52 @@ def exact_fci_reference(outdir: Path, nroots: int = 24) -> pd.DataFrame:
         'norb': int(norb),
         'neutral_fci_total_Ha': float(e0),
         'rhf_total_Ha': float(mf.e_tot),
+        'dyson_weight_convention': '2 * alpha-removal strength for closed-shell singlet',
     }
     (outdir / 'fci_metadata.json').write_text(json.dumps(meta, indent=2))
     return df
+
+
+def append_result(raw_rows: list[dict], s: float, d: dict) -> tuple[np.ndarray, np.ndarray]:
+    e = np.asarray(d['evals_eV'], dtype=float).reshape(-1)
+    p = np.asarray(d['spectroscopic_factors'], dtype=float).reshape(-1)
+    if e.size != p.size:
+        raise ValueError(f'eigenvalue/spec-factor length mismatch at s={s}: {e.size} != {p.size}')
+    for k, (ek, pk) in enumerate(zip(e, p), start=1):
+        raw_rows.append({
+            's': s,
+            'root': k,
+            'ip_eV': float(ek),
+            'spectroscopic_factor': float(pk),
+            'spin': d['spin'][k - 1] if k - 1 < len(d['spin']) else '',
+            'symmetry': d['symmetry'][k - 1] if k - 1 < len(d['symmetry']) else '',
+            'neutral_energy_Ha': d.get('neutral_energy_Ha', np.nan),
+        })
+    return e, p
+
+
+def validate_regression(e: np.ndarray, p: np.ndarray) -> dict:
+    result = {
+        'target_s': REGRESSION_S,
+        'expected_ips_eV': TEST_IPS.tolist(),
+        'expected_specs': TEST_SPECS.tolist(),
+        'computed_ips_eV': e[:4].tolist(),
+        'computed_specs': p[:4].tolist(),
+        'ncomputed': int(min(e.size, p.size)),
+    }
+    if e.size < 4 or p.size < 4:
+        result['max_ip_deviation_eV'] = None
+        result['max_spec_deviation'] = None
+        result['passed'] = False
+        result['reason'] = 'fewer than four regression roots returned'
+        return result
+    result['max_ip_deviation_eV'] = float(np.max(np.abs(e[:4] - TEST_IPS)))
+    result['max_spec_deviation'] = float(np.max(np.abs(p[:4] - TEST_SPECS)))
+    result['passed'] = bool(
+        result['max_ip_deviation_eV'] < 1e-6
+        and result['max_spec_deviation'] < 1e-5
+    )
+    return result
 
 
 def match_principal(raw: pd.DataFrame, ref: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -202,9 +249,8 @@ def match_principal(raw: pd.DataFrame, ref: pd.DataFrame) -> tuple[pd.DataFrame,
             continue
         A = gp[['ip_eV', 'spectroscopic_factor']].to_numpy()
         B = refp[['ip_eV', 'dyson_weight_spin_summed']].to_numpy()
-        cost = np.abs(A[:, None, 0] - B[None, :, 0]) + 0.25*np.abs(A[:, None, 1] - B[None, :, 1])
+        cost = np.abs(A[:, None, 0] - B[None, :, 0]) + 0.25 * np.abs(A[:, None, 1] - B[None, :, 1])
         ii, jj = linear_sum_assignment(cost)
-        # Keep a compact chemically relevant energy window and reasonable matches.
         pairs = []
         for i, j in zip(ii, jj):
             rg = gp.iloc[i]
@@ -226,10 +272,23 @@ def match_principal(raw: pd.DataFrame, ref: pd.DataFrame) -> tuple[pd.DataFrame,
             })
         if pairs:
             a = np.asarray(pairs)
-            summary.append({'s': s, 'nmatch': len(a), 'MAE_eV': float(np.mean(abs(a))), 'MSE_eV': float(np.mean(a)), 'MAX_eV': float(np.max(abs(a)))})
+            summary.append({
+                's': s,
+                'nmatch': len(a),
+                'MAE_eV': float(np.mean(np.abs(a))),
+                'MSE_eV': float(np.mean(a)),
+                'MAX_eV': float(np.max(np.abs(a))),
+            })
         else:
             summary.append({'s': s, 'nmatch': 0, 'MAE_eV': np.nan, 'MSE_eV': np.nan, 'MAX_eV': np.nan})
     return pd.DataFrame(all_matches), pd.DataFrame(summary)
+
+
+def write_raw_and_failures(outdir: Path, raw_rows: list[dict], failures: list[dict]) -> pd.DataFrame:
+    raw = pd.DataFrame(raw_rows)
+    raw.to_csv(outdir / 'sweep_raw.csv', index=False)
+    pd.DataFrame(failures, columns=['s', 'error']).to_csv(outdir / 'failures.csv', index=False)
+    return raw
 
 
 def main():
@@ -241,47 +300,51 @@ def main():
     args.outdir.mkdir(parents=True, exist_ok=True)
 
     ref = exact_fci_reference(args.outdir)
+    raw_rows: list[dict] = []
+    failures: list[dict] = []
 
-    raw_rows = []
-    failures = []
-    validation = {'target_s': 0.5, 'expected_ips_eV': TEST_IPS.tolist(), 'expected_specs': TEST_SPECS.tolist()}
+    # Hard acceptance gate: reproduce the public NiuPy s=0.5 test first.
+    print(f'=== regression gate s={REGRESSION_S:.4f} ===', flush=True)
+    try:
+        d = run_case(REGRESSION_S, args.workdir)
+        e, p = append_result(raw_rows, REGRESSION_S, d)
+        validation = validate_regression(e, p)
+    except Exception as exc:
+        failures.append({'s': REGRESSION_S, 'error': repr(exc)})
+        validation = {
+            'target_s': REGRESSION_S,
+            'expected_ips_eV': TEST_IPS.tolist(),
+            'expected_specs': TEST_SPECS.tolist(),
+            'passed': False,
+            'reason': repr(exc),
+        }
+
+    validation['failures'] = list(failures)
+    write_raw_and_failures(args.outdir, raw_rows, failures)
+    (args.outdir / 'validation.json').write_text(json.dumps(validation, indent=2))
+    print(json.dumps(validation, indent=2))
+    if not validation['passed']:
+        raise SystemExit('Published NiuPy s=0.5 regression check did not pass; sweep aborted.')
+
+    # Only validated software reaches the flow-parameter map.
     for s in S_VALUES:
+        if abs(s - REGRESSION_S) < 1e-12:
+            continue
         print(f'=== s={s:.4f} ===', flush=True)
         try:
             d = run_case(s, args.workdir)
-            e = np.asarray(d['evals_eV'], dtype=float)
-            p = np.asarray(d['spectroscopic_factors'], dtype=float)
-            for k, (ek, pk) in enumerate(zip(e, p), start=1):
-                raw_rows.append({
-                    's': s,
-                    'root': k,
-                    'ip_eV': float(ek),
-                    'spectroscopic_factor': float(pk),
-                    'spin': d['spin'][k-1] if k-1 < len(d['spin']) else '',
-                    'symmetry': d['symmetry'][k-1] if k-1 < len(d['symmetry']) else '',
-                    'neutral_energy_Ha': d.get('neutral_energy_Ha', np.nan),
-                })
-            if abs(s - 0.5) < 1e-12:
-                validation['computed_ips_eV'] = e[:4].tolist()
-                validation['computed_specs'] = p[:4].tolist()
-                validation['max_ip_deviation_eV'] = float(np.max(abs(e[:4] - TEST_IPS)))
-                validation['max_spec_deviation'] = float(np.max(abs(p[:4] - TEST_SPECS)))
+            append_result(raw_rows, s, d)
         except Exception as exc:
             failures.append({'s': s, 'error': repr(exc)})
             print(f'FAILED s={s}: {exc}', file=sys.stderr, flush=True)
 
-    raw = pd.DataFrame(raw_rows)
-    raw.to_csv(args.outdir / 'sweep_raw.csv', index=False)
-    pd.DataFrame(failures).to_csv(args.outdir / 'failures.csv', index=False)
+    raw = write_raw_and_failures(args.outdir, raw_rows, failures)
     matches, summary = match_principal(raw, ref) if not raw.empty else (pd.DataFrame(), pd.DataFrame())
     matches.to_csv(args.outdir / 'principal_matches.csv', index=False)
     summary.to_csv(args.outdir / 'summary.csv', index=False)
 
-    validation['passed'] = bool(
-        validation.get('max_ip_deviation_eV', np.inf) < 1e-6 and
-        validation.get('max_spec_deviation', np.inf) < 1e-5
-    )
     validation['failures'] = failures
+    validation['sweep_complete'] = len(failures) == 0
     (args.outdir / 'validation.json').write_text(json.dumps(validation, indent=2))
 
     print('\n=== exact FCI reference ===')
@@ -290,9 +353,6 @@ def main():
     print(summary.to_string(index=False) if not summary.empty else 'no successful cases')
     print('\n=== validation ===')
     print(json.dumps(validation, indent=2))
-
-    if not validation['passed']:
-        raise SystemExit('Published NiuPy s=0.5 regression check did not pass.')
 
 
 if __name__ == '__main__':
