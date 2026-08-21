@@ -50,6 +50,7 @@ jobs:
       - name: Verify prebuilt Psi4 and Ambit
         run: |
           psi4 --version
+          cmake --version
           python - <<'PY'
           import psi4, ambit
           print('psi4', psi4.__version__)
@@ -90,6 +91,15 @@ jobs:
           test -f README.md
           test -f setup.py
           grep -q 'version="1.0.1"' setup.py
+          # CMake 4 removed compatibility modes below 3.5. The pinned historical
+          # Wick&d source declares 3.1 and its pinned pybind11 declares 3.4.
+          # Lift only those build-policy floors in this ephemeral checkout.
+          grep -Fxq 'cmake_minimum_required(VERSION 3.1)' CMakeLists.txt
+          grep -Fxq 'cmake_minimum_required(VERSION 3.4)' external/pybind11/CMakeLists.txt
+          sed -i 's/cmake_minimum_required(VERSION 3.1)/cmake_minimum_required(VERSION 3.5)/' CMakeLists.txt
+          sed -i 's/cmake_minimum_required(VERSION 3.4)/cmake_minimum_required(VERSION 3.5)/' external/pybind11/CMakeLists.txt
+          grep -Fxq 'cmake_minimum_required(VERSION 3.5)' CMakeLists.txt
+          grep -Fxq 'cmake_minimum_required(VERSION 3.5)' external/pybind11/CMakeLists.txt
           sed -n '1,30p' setup.py
           python setup.py develop
           echo "PYTHONPATH=$HOME/wicked:${PYTHONPATH:-}" >> "$GITHUB_ENV"
