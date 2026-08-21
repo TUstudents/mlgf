@@ -44,34 +44,22 @@ jobs:
           auto-activate-base: false
           add-pip-as-python-dependency: true
 
-      - name: Verify prebuilt Psi4
+      - name: Verify prebuilt Psi4 and Ambit
         run: |
           psi4 --version
           python - <<'PY'
-          import psi4
+          import psi4, ambit
           print('psi4', psi4.__version__)
+          print('ambit import ok')
           PY
-
-      - name: Build Ambit
-        run: |
-          cd "$HOME"
-          git clone --depth 1 https://github.com/jturney/ambit.git
-          cmake -S ambit -B ambit/objdir \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INSTALL_PREFIX="$HOME/bin/ambit"
-          cmake --build ambit/objdir -j2
-          cmake --install ambit/objdir
-          echo "AMBITPATH=$HOME/bin/ambit" >> "$GITHUB_ENV"
-          echo "PYTHONPATH=$HOME/bin/ambit/lib:${PYTHONPATH:-}" >> "$GITHUB_ENV"
+          test -d "${CONDA_PREFIX}/share/cmake/ambit"
 
       - name: Build Forte eom-dsrg branch
         run: |
-          export PYTHONPATH="$HOME/bin/ambit/lib:${PYTHONPATH:-}"
-          export AMBITPATH="$HOME/bin/ambit"
           cd "$HOME"
           git clone --depth 1 -b eom-dsrg https://github.com/evangelistalab/forte.git
           cd forte
-          ambit_dir="$HOME/bin/ambit/share/cmake/ambit/"
+          ambit_dir="${CONDA_PREFIX}/share/cmake/ambit/"
           cmake_psi4="$(psi4 --plugin-compile)"
           $cmake_psi4 \
             -Dambit_DIR="$ambit_dir" \
@@ -80,7 +68,7 @@ jobs:
             -DPYTHON_EXECUTABLE="${CONDA_PREFIX}/bin/python" \
             -DENABLE_ForteTests=TRUE
           make -j2
-          echo "PYTHONPATH=$HOME/bin/ambit/lib:$HOME/forte:${PYTHONPATH:-}" >> "$GITHUB_ENV"
+          echo "PYTHONPATH=$HOME/forte:${PYTHONPATH:-}" >> "$GITHUB_ENV"
 
       - name: Build Wick&d PR 20
         run: |
@@ -99,19 +87,19 @@ jobs:
 
       - name: Verify imports
         run: |
-          export PYTHONPATH="$HOME/bin/ambit/lib:$HOME/forte:${PYTHONPATH:-}"
+          export PYTHONPATH="$HOME/forte:${PYTHONPATH:-}"
           python - <<'PY'
-          import psi4, forte, niupy, wicked
+          import psi4, forte, niupy, wicked, ambit
           print('psi4', psi4.__version__)
           print('forte', getattr(forte, '__version__', 'unknown'))
           print('niupy import ok')
           print('wicked import ok')
+          print('ambit import ok')
           PY
 
       - name: Run BeH2 DSRG s-sweep and exact FCI benchmark
         run: |
-          export PYTHONPATH="$HOME/bin/ambit/lib:$HOME/forte:${PYTHONPATH:-}"
-          export AMBITPATH="$HOME/bin/ambit"
+          export PYTHONPATH="$HOME/forte:${PYTHONPATH:-}"
           python experiments/dsrg_flow/run_sweep.py --workdir "$RUNNER_TEMP/dsrg_sweep" --outdir experiments/dsrg_flow/results
 
       - name: Show summary
