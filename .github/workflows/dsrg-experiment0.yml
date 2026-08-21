@@ -29,12 +29,16 @@ jobs:
       - name: Checkout experiment branch
         uses: actions/checkout@v4
 
-      - name: Setup Conda with Psi4 1.11
-        uses: conda-incubator/setup-miniconda@v3
+      - name: Setup Miniforge/Mamba with Psi4 1.11
+        uses: conda-incubator/setup-miniconda@v4
         with:
+          miniforge-version: latest
+          use-mamba: true
           activate-environment: niupy
           environment-file: experiments/dsrg_flow/environment.yml
           channels: conda-forge
+          channel-priority: strict
+          conda-remove-defaults: "true"
           show-channel-urls: true
           python-version: "3.10"
           auto-activate-base: false
