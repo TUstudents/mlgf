@@ -1,0 +1,32 @@
+name: niupy
+
+dependencies:
+  - python=3.10
+  - pip
+  - pybind11
+  - cxx-compiler
+  - mkl
+  - cmake=3.21
+  - numpy
+  - scipy
+  - pandas
+  - eigen
+  - boost
+  - pint
+  - pydantic
+  - pyyaml
+  - py-cpuinfo
+  - hdf5
+  - yaml
+  - pytest
+  - conda-forge::lcov
+  - conda-forge::libint
+  - conda-forge::libxc
+  - psi4::gau2grid
+  - conda-forge::qcelemental
+  - conda-forge::qcengine
+  - conda-forge::optking
+  - conda-forge::pyscf
+  - conda-forge::libecpint
+  - conda-forge::psutil
+  - conda-forge::opt_einsum

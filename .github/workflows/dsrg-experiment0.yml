@@ -1,0 +1,130 @@
+name: DSRG Experiment 0
+
+on:
+  push:
+    branches:
+      - experiment/dsrg-flow-20260821
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  OPENBLAS_NUM_THREADS: "1"
+  OMP_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+
+jobs:
+  dsrg-flow-sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash -el {0}
+
+    steps:
+      - name: Checkout experiment branch
+        uses: actions/checkout@v4
+
+      - name: Setup Conda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: niupy
+          environment-file: experiments/dsrg_flow/environment.yml
+          channels: conda-forge
+          show-channel-urls: true
+          python-version: "3.10"
+          auto-activate-base: false
+          add-pip-as-python-dependency: true
+
+      - name: Build Ambit
+        run: |
+          cd "$HOME"
+          git clone --depth 1 https://github.com/jturney/ambit.git
+          cmake -S ambit -B ambit/objdir \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$HOME/bin/ambit"
+          cmake --build ambit/objdir -j4
+          cmake --install ambit/objdir
+
+      - name: Build Psi4 master
+        run: |
+          cd "$HOME"
+          git clone --depth 1 https://github.com/psi4/psi4.git
+          cmake -S psi4 -B psi4/objdir \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_INSTALL_PREFIX="$HOME/psi4bin" \
+            -DENABLE_ecpint=ON
+          cmake --build psi4/objdir -j4
+          echo "$HOME/psi4/objdir/stage/bin" >> "$GITHUB_PATH"
+          echo "PYTHONPATH=$HOME/psi4/objdir/stage/lib:$HOME/bin/ambit/lib:${PYTHONPATH:-}" >> "$GITHUB_ENV"
+          echo "AMBITPATH=$HOME/bin/ambit" >> "$GITHUB_ENV"
+
+      - name: Build Forte eom-dsrg branch
+        run: |
+          export PATH="$HOME/psi4/objdir/stage/bin:$PATH"
+          export PYTHONPATH="$HOME/psi4/objdir/stage/lib:$HOME/bin/ambit/lib:${PYTHONPATH:-}"
+          export AMBITPATH="$HOME/bin/ambit"
+          cd "$HOME"
+          git clone --depth 1 -b eom-dsrg https://github.com/evangelistalab/forte.git
+          cd forte
+          ambit_dir="$HOME/bin/ambit/share/cmake/ambit/"
+          cmake_psi4="$(psi4 --plugin-compile)"
+          $cmake_psi4 \
+            -Dambit_DIR="$ambit_dir" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMAX_DET_ORB=128 \
+            -DPYTHON_EXECUTABLE="${CONDA_PREFIX}/bin/python" \
+            -DENABLE_ForteTests=TRUE
+          make -j4
+          echo "PYTHONPATH=$HOME/psi4/objdir/stage/lib:$HOME/bin/ambit/lib:$HOME/forte:${PYTHONPATH:-}" >> "$GITHUB_ENV"
+
+      - name: Build Wick&d PR 20
+        run: |
+          cd "$HOME"
+          git clone --recurse-submodules https://github.com/fevangelista/wicked.git
+          cd wicked
+          git fetch origin pull/20/head:pr-20
+          git checkout pr-20
+          python setup.py develop
+
+      - name: Install NiuPy
+        run: |
+          cd "$HOME"
+          git clone --depth 1 https://github.com/shuhangli98/niupy.git
+          pip install -e niupy
+
+      - name: Verify imports
+        run: |
+          export PATH="$HOME/psi4/objdir/stage/bin:$PATH"
+          export PYTHONPATH="$HOME/psi4/objdir/stage/lib:$HOME/bin/ambit/lib:$HOME/forte:${PYTHONPATH:-}"
+          python - <<'PY'
+          import psi4, forte, niupy, wicked
+          print('psi4', psi4.__version__)
+          print('forte', getattr(forte, '__version__', 'unknown'))
+          print('niupy import ok')
+          print('wicked import ok')
+          PY
+
+      - name: Run BeH2 DSRG s-sweep and exact FCI benchmark
+        run: |
+          export PATH="$HOME/psi4/objdir/stage/bin:$PATH"
+          export PYTHONPATH="$HOME/psi4/objdir/stage/lib:$HOME/bin/ambit/lib:$HOME/forte:${PYTHONPATH:-}"
+          export AMBITPATH="$HOME/bin/ambit"
+          python experiments/dsrg_flow/run_sweep.py --workdir "$RUNNER_TEMP/dsrg_sweep" --outdir experiments/dsrg_flow/results
+
+      - name: Show summary
+        if: always()
+        run: |
+          find experiments/dsrg_flow/results -maxdepth 2 -type f -print || true
+          test -f experiments/dsrg_flow/results/summary.csv && cat experiments/dsrg_flow/results/summary.csv || true
+          test -f experiments/dsrg_flow/results/fci_reference.csv && cat experiments/dsrg_flow/results/fci_reference.csv || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsrg-experiment0-results
+          path: |
+            experiments/dsrg_flow/results/**
+          if-no-files-found: warn
