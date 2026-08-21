@@ -24,7 +24,8 @@ from scipy.optimize import linear_sum_assignment
 EV = 27.211386245988
 REGRESSION_S = 0.50
 S_VALUES = [0.0, 0.01, 0.05, 0.10, 0.25, 0.35, 0.50, 0.75, 1.00, 1.25]
-TEST_IPS = np.array([11.0712299825, 12.9096937411, 17.2339756217, 17.3971330715])
+# Exact expectations for NiuPy's public EOM_DSRG.kernel() BeH2 regression.
+TEST_IPS = np.array([11.0712299826, 12.9096937411, 17.2339756217, 17.3971330810])
 TEST_SPECS = np.array([1.97180714, 1.95473561, 0.0, 0.00213609])
 
 
@@ -86,8 +87,6 @@ eom = niupy.EOM_DSRG(
     max_cycle=200,
     tol_s=1e-10,
     tol_semi=1e-10,
-    e_tol=1e-9,
-    r_tol=1e-6,
     method_type="ip",
 )
 eom.kernel()
@@ -220,6 +219,8 @@ def validate_regression(e: np.ndarray, p: np.ndarray) -> dict:
         'computed_ips_eV': e[:4].tolist(),
         'computed_specs': p[:4].tolist(),
         'ncomputed': int(min(e.size, p.size)),
+        'ip_abs_tolerance_eV': 1e-8,
+        'spec_abs_tolerance': 1e-6,
     }
     if e.size < 4 or p.size < 4:
         result['max_ip_deviation_eV'] = None
@@ -230,8 +231,8 @@ def validate_regression(e: np.ndarray, p: np.ndarray) -> dict:
     result['max_ip_deviation_eV'] = float(np.max(np.abs(e[:4] - TEST_IPS)))
     result['max_spec_deviation'] = float(np.max(np.abs(p[:4] - TEST_SPECS)))
     result['passed'] = bool(
-        result['max_ip_deviation_eV'] < 1e-6
-        and result['max_spec_deviation'] < 1e-5
+        result['max_ip_deviation_eV'] < 1e-8
+        and result['max_spec_deviation'] < 1e-6
     )
     return result
 
