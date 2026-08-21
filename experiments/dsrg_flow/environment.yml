@@ -1,32 +1,20 @@
 name: niupy
+channels:
+  - conda-forge
 
 dependencies:
   - python=3.10
   - pip
-  - pybind11
+  - cmake>=3.21
   - cxx-compiler
-  - mkl
-  - cmake=3.21
+  - pybind11
+  - eigen
+  - boost
+  - hdf5
   - numpy
   - scipy
   - pandas
-  - eigen
-  - boost
-  - pint
-  - pydantic
   - pyyaml
-  - py-cpuinfo
-  - hdf5
-  - yaml
-  - pytest
-  - conda-forge::lcov
-  - conda-forge::psi4=1.11
-  - conda-forge::libint
-  - conda-forge::libxc
-  - conda-forge::qcelemental
-  - conda-forge::qcengine
-  - conda-forge::optking
-  - conda-forge::pyscf
-  - conda-forge::libecpint
-  - conda-forge::psutil
-  - conda-forge::opt_einsum
+  - opt_einsum
+  - pyscf
+  - psi4=1.11
