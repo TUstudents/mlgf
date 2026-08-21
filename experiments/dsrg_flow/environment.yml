@@ -18,3 +18,5 @@ dependencies:
   - opt_einsum
   - pyscf
   - psi4=1.11
+  - ambit=0.7.1
+  - pyambit=0.7.1
