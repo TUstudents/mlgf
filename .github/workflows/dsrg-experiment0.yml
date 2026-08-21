@@ -29,7 +29,7 @@ jobs:
       - name: Checkout experiment branch
         uses: actions/checkout@v4
 
-      - name: Setup Conda
+      - name: Setup Conda with Psi4 1.11
         uses: conda-incubator/setup-miniconda@v3
         with:
           activate-environment: niupy
@@ -40,6 +40,14 @@ jobs:
           auto-activate-base: false
           add-pip-as-python-dependency: true
 
+      - name: Verify prebuilt Psi4
+        run: |
+          psi4 --version
+          python - <<'PY'
+          import psi4
+          print('psi4', psi4.__version__)
+          PY
+
       - name: Build Ambit
         run: |
           cd "$HOME"
@@ -47,26 +55,14 @@ jobs:
           cmake -S ambit -B ambit/objdir \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$HOME/bin/ambit"
-          cmake --build ambit/objdir -j4
+          cmake --build ambit/objdir -j2
           cmake --install ambit/objdir
-
-      - name: Build Psi4 master
-        run: |
-          cd "$HOME"
-          git clone --depth 1 https://github.com/psi4/psi4.git
-          cmake -S psi4 -B psi4/objdir \
-            -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_INSTALL_PREFIX="$HOME/psi4bin" \
-            -DENABLE_ecpint=ON
-          cmake --build psi4/objdir -j4
-          echo "$HOME/psi4/objdir/stage/bin" >> "$GITHUB_PATH"
-          echo "PYTHONPATH=$HOME/psi4/objdir/stage/lib:$HOME/bin/ambit/lib:${PYTHONPATH:-}" >> "$GITHUB_ENV"
           echo "AMBITPATH=$HOME/bin/ambit" >> "$GITHUB_ENV"
+          echo "PYTHONPATH=$HOME/bin/ambit/lib:${PYTHONPATH:-}" >> "$GITHUB_ENV"
 
       - name: Build Forte eom-dsrg branch
         run: |
-          export PATH="$HOME/psi4/objdir/stage/bin:$PATH"
-          export PYTHONPATH="$HOME/psi4/objdir/stage/lib:$HOME/bin/ambit/lib:${PYTHONPATH:-}"
+          export PYTHONPATH="$HOME/bin/ambit/lib:${PYTHONPATH:-}"
           export AMBITPATH="$HOME/bin/ambit"
           cd "$HOME"
           git clone --depth 1 -b eom-dsrg https://github.com/evangelistalab/forte.git
@@ -79,8 +75,8 @@ jobs:
             -DMAX_DET_ORB=128 \
             -DPYTHON_EXECUTABLE="${CONDA_PREFIX}/bin/python" \
             -DENABLE_ForteTests=TRUE
-          make -j4
-          echo "PYTHONPATH=$HOME/psi4/objdir/stage/lib:$HOME/bin/ambit/lib:$HOME/forte:${PYTHONPATH:-}" >> "$GITHUB_ENV"
+          make -j2
+          echo "PYTHONPATH=$HOME/bin/ambit/lib:$HOME/forte:${PYTHONPATH:-}" >> "$GITHUB_ENV"
 
       - name: Build Wick&d PR 20
         run: |
@@ -99,8 +95,7 @@ jobs:
 
       - name: Verify imports
         run: |
-          export PATH="$HOME/psi4/objdir/stage/bin:$PATH"
-          export PYTHONPATH="$HOME/psi4/objdir/stage/lib:$HOME/bin/ambit/lib:$HOME/forte:${PYTHONPATH:-}"
+          export PYTHONPATH="$HOME/bin/ambit/lib:$HOME/forte:${PYTHONPATH:-}"
           python - <<'PY'
           import psi4, forte, niupy, wicked
           print('psi4', psi4.__version__)
@@ -111,8 +106,7 @@ jobs:
 
       - name: Run BeH2 DSRG s-sweep and exact FCI benchmark
         run: |
-          export PATH="$HOME/psi4/objdir/stage/bin:$PATH"
-          export PYTHONPATH="$HOME/psi4/objdir/stage/lib:$HOME/bin/ambit/lib:$HOME/forte:${PYTHONPATH:-}"
+          export PYTHONPATH="$HOME/bin/ambit/lib:$HOME/forte:${PYTHONPATH:-}"
           export AMBITPATH="$HOME/bin/ambit"
           python experiments/dsrg_flow/run_sweep.py --workdir "$RUNNER_TEMP/dsrg_sweep" --outdir experiments/dsrg_flow/results
 
@@ -122,6 +116,8 @@ jobs:
           find experiments/dsrg_flow/results -maxdepth 2 -type f -print || true
           test -f experiments/dsrg_flow/results/summary.csv && cat experiments/dsrg_flow/results/summary.csv || true
           test -f experiments/dsrg_flow/results/fci_reference.csv && cat experiments/dsrg_flow/results/fci_reference.csv || true
+          test -f experiments/dsrg_flow/results/validation.json && cat experiments/dsrg_flow/results/validation.json || true
+          test -f experiments/dsrg_flow/results/failures.csv && cat experiments/dsrg_flow/results/failures.csv || true
 
       - name: Upload results
         if: always()
