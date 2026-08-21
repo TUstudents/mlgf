@@ -16,6 +16,9 @@ env:
   OPENBLAS_NUM_THREADS: "1"
   OMP_NUM_THREADS: "1"
   MKL_NUM_THREADS: "1"
+  FORTE_SHA: "76621aa6cfd09c70eb149b81aa4d7e85f1d705aa"
+  WICKED_SHA: "da2b14702e0df9ec965489b6b4b795f93f964cf2"
+  NIUPY_SHA: "a620393560314926f310997a849863cdf8986a9d"
 
 jobs:
   dsrg-flow-sweep:
@@ -54,11 +57,13 @@ jobs:
           PY
           test -d "${CONDA_PREFIX}/share/cmake/ambit"
 
-      - name: Build Forte eom-dsrg branch
+      - name: Build pinned Forte eom-dsrg revision
         run: |
           cd "$HOME"
           git clone --depth 1 -b eom-dsrg https://github.com/evangelistalab/forte.git
           cd forte
+          test "$(git rev-parse HEAD)" = "$FORTE_SHA"
+          printf 'Forte revision: %s\n' "$(git rev-parse HEAD)"
           ambit_dir="${CONDA_PREFIX}/share/cmake/ambit/"
           cmake_psi4="$(psi4 --plugin-compile)"
           $cmake_psi4 \
@@ -70,24 +75,38 @@ jobs:
           make -j2
           echo "PYTHONPATH=$HOME/forte:${PYTHONPATH:-}" >> "$GITHUB_ENV"
 
-      - name: Build Wick&d PR 20
+      - name: Build pinned Wick&d PR 20 revision
         run: |
           cd "$HOME"
-          git clone --recurse-submodules https://github.com/fevangelista/wicked.git
+          rm -rf wicked
+          git init wicked
           cd wicked
-          git fetch origin pull/20/head:pr-20
-          git checkout pr-20
+          git remote add origin https://github.com/fevangelista/wicked.git
+          git fetch --depth 1 origin "$WICKED_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$WICKED_SHA"
+          git submodule update --init --recursive
+          printf 'Wick&d revision: %s\n' "$(git rev-parse HEAD)"
+          test -f README.md
+          test -f setup.py
+          grep -q 'version="1.0.1"' setup.py
+          sed -n '1,30p' setup.py
           python setup.py develop
+          echo "PYTHONPATH=$HOME/wicked:${PYTHONPATH:-}" >> "$GITHUB_ENV"
 
-      - name: Install NiuPy
+      - name: Install pinned NiuPy revision
         run: |
           cd "$HOME"
-          git clone --depth 1 https://github.com/shuhangli98/niupy.git
-          pip install -e niupy
+          git clone https://github.com/shuhangli98/niupy.git
+          cd niupy
+          git checkout --detach "$NIUPY_SHA"
+          test "$(git rev-parse HEAD)" = "$NIUPY_SHA"
+          printf 'NiuPy revision: %s\n' "$(git rev-parse HEAD)"
+          pip install -e .
 
       - name: Verify imports
         run: |
-          export PYTHONPATH="$HOME/forte:${PYTHONPATH:-}"
+          export PYTHONPATH="$HOME/wicked:$HOME/forte:${PYTHONPATH:-}"
           python - <<'PY'
           import psi4, forte, niupy, wicked, ambit
           print('psi4', psi4.__version__)
@@ -99,7 +118,7 @@ jobs:
 
       - name: Run BeH2 DSRG s-sweep and exact FCI benchmark
         run: |
-          export PYTHONPATH="$HOME/forte:${PYTHONPATH:-}"
+          export PYTHONPATH="$HOME/wicked:$HOME/forte:${PYTHONPATH:-}"
           python experiments/dsrg_flow/run_sweep.py --workdir "$RUNNER_TEMP/dsrg_sweep" --outdir experiments/dsrg_flow/results
 
       - name: Show summary
