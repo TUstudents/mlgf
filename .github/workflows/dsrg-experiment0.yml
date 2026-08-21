@@ -1,0 +1,150 @@
+name: DSRG Experiment 0
+
+on:
+  push:
+    branches:
+      - experiment/dsrg-flow-20260821
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  OPENBLAS_NUM_THREADS: "1"
+  OMP_NUM_THREADS: "1"
+  MKL_NUM_THREADS: "1"
+  FORTE_SHA: "76621aa6cfd09c70eb149b81aa4d7e85f1d705aa"
+  WICKED_SHA: "da2b14702e0df9ec965489b6b4b795f93f964cf2"
+  NIUPY_SHA: "a620393560314926f310997a849863cdf8986a9d"
+
+jobs:
+  dsrg-flow-sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash -el {0}
+
+    steps:
+      - name: Checkout experiment branch
+        uses: actions/checkout@v4
+
+      - name: Setup Miniforge/Mamba with Psi4 1.11
+        uses: conda-incubator/setup-miniconda@v4
+        with:
+          miniforge-version: latest
+          use-mamba: true
+          activate-environment: niupy
+          environment-file: experiments/dsrg_flow/environment.yml
+          channels: conda-forge
+          channel-priority: strict
+          conda-remove-defaults: "true"
+          show-channel-urls: true
+          python-version: "3.10"
+          auto-activate-base: false
+          add-pip-as-python-dependency: true
+
+      - name: Verify prebuilt Psi4 and Ambit
+        run: |
+          psi4 --version
+          cmake --version
+          python - <<'PY'
+          import psi4, ambit
+          print('psi4', psi4.__version__)
+          print('ambit import ok')
+          PY
+          test -d "${CONDA_PREFIX}/share/cmake/ambit"
+
+      - name: Build pinned Forte eom-dsrg revision
+        run: |
+          cd "$HOME"
+          git clone --depth 1 -b eom-dsrg https://github.com/evangelistalab/forte.git
+          cd forte
+          test "$(git rev-parse HEAD)" = "$FORTE_SHA"
+          printf 'Forte revision: %s\n' "$(git rev-parse HEAD)"
+          ambit_dir="${CONDA_PREFIX}/share/cmake/ambit/"
+          cmake_psi4="$(psi4 --plugin-compile)"
+          $cmake_psi4 \
+            -Dambit_DIR="$ambit_dir" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMAX_DET_ORB=128 \
+            -DPYTHON_EXECUTABLE="${CONDA_PREFIX}/bin/python" \
+            -DENABLE_ForteTests=TRUE
+          make -j2
+          echo "PYTHONPATH=$HOME/forte:${PYTHONPATH:-}" >> "$GITHUB_ENV"
+
+      - name: Build pinned Wick&d PR 20 revision
+        run: |
+          cd "$HOME"
+          rm -rf wicked
+          git init wicked
+          cd wicked
+          git remote add origin https://github.com/fevangelista/wicked.git
+          git fetch --depth 1 origin "$WICKED_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$WICKED_SHA"
+          git submodule update --init --recursive
+          printf 'Wick&d revision: %s\n' "$(git rev-parse HEAD)"
+          test -f README.md
+          test -f setup.py
+          grep -q 'version="1.0.1"' setup.py
+          # CMake 4 removed compatibility modes below 3.5. The pinned historical
+          # Wick&d source declares 3.1 and its pinned pybind11 declares 3.4.
+          # Lift only those build-policy floors in this ephemeral checkout.
+          grep -Fxq 'cmake_minimum_required(VERSION 3.1)' CMakeLists.txt
+          grep -Fxq 'cmake_minimum_required(VERSION 3.4)' external/pybind11/CMakeLists.txt
+          sed -i 's/cmake_minimum_required(VERSION 3.1)/cmake_minimum_required(VERSION 3.5)/' CMakeLists.txt
+          sed -i 's/cmake_minimum_required(VERSION 3.4)/cmake_minimum_required(VERSION 3.5)/' external/pybind11/CMakeLists.txt
+          grep -Fxq 'cmake_minimum_required(VERSION 3.5)' CMakeLists.txt
+          grep -Fxq 'cmake_minimum_required(VERSION 3.5)' external/pybind11/CMakeLists.txt
+          sed -n '1,30p' setup.py
+          python setup.py develop
+          echo "PYTHONPATH=$HOME/wicked:${PYTHONPATH:-}" >> "$GITHUB_ENV"
+
+      - name: Install pinned NiuPy revision
+        run: |
+          cd "$HOME"
+          git clone https://github.com/shuhangli98/niupy.git
+          cd niupy
+          git checkout --detach "$NIUPY_SHA"
+          test "$(git rev-parse HEAD)" = "$NIUPY_SHA"
+          printf 'NiuPy revision: %s\n' "$(git rev-parse HEAD)"
+          pip install -e .
+
+      - name: Verify imports
+        run: |
+          export PYTHONPATH="$HOME/wicked:$HOME/forte:${PYTHONPATH:-}"
+          python - <<'PY'
+          import psi4, forte, niupy, wicked, ambit
+          print('psi4', psi4.__version__)
+          print('forte', getattr(forte, '__version__', 'unknown'))
+          print('niupy import ok')
+          print('wicked import ok')
+          print('ambit import ok')
+          PY
+
+      - name: Run BeH2 DSRG s-sweep and exact FCI benchmark
+        run: |
+          export PYTHONPATH="$HOME/wicked:$HOME/forte:${PYTHONPATH:-}"
+          python experiments/dsrg_flow/run_sweep.py --workdir "$RUNNER_TEMP/dsrg_sweep" --outdir experiments/dsrg_flow/results
+
+      - name: Show summary
+        if: always()
+        run: |
+          find experiments/dsrg_flow/results -maxdepth 2 -type f -print || true
+          test -f experiments/dsrg_flow/results/summary.csv && cat experiments/dsrg_flow/results/summary.csv || true
+          test -f experiments/dsrg_flow/results/fci_reference.csv && cat experiments/dsrg_flow/results/fci_reference.csv || true
+          test -f experiments/dsrg_flow/results/validation.json && cat experiments/dsrg_flow/results/validation.json || true
+          test -f experiments/dsrg_flow/results/failures.csv && cat experiments/dsrg_flow/results/failures.csv || true
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsrg-experiment0-results
+          path: |
+            experiments/dsrg_flow/results/**
+          if-no-files-found: warn

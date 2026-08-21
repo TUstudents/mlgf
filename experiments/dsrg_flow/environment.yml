@@ -1,0 +1,22 @@
+name: niupy
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.10
+  - pip
+  - cmake=4.4.2
+  - cxx-compiler
+  - pybind11
+  - eigen
+  - boost
+  - hdf5
+  - numpy
+  - scipy
+  - pandas
+  - pyyaml
+  - opt_einsum
+  - pyscf
+  - psi4=1.11
+  - ambit=0.7.1
+  - pyambit=0.7.1
